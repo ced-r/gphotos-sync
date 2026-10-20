@@ -14,9 +14,13 @@ from appdirs import AppDirs
 from gphotos_sync import Utils, __version__
 from gphotos_sync.authorize import Authorize
 from gphotos_sync.Checks import do_check, get_check
-from gphotos_sync.GoogleAlbumsSync import GoogleAlbumsSync
 from gphotos_sync.GooglePhotosDownload import GooglePhotosDownload  # type: ignore
 from gphotos_sync.GooglePhotosIndex import GooglePhotosIndex
+from gphotos_sync.GooglePhotosPicker import (
+    PICKER_API_URL,
+    PICKER_SCOPE,
+    PickerSession,
+)
 from gphotos_sync.LocalData import LocalData
 from gphotos_sync.LocalFilesScan import LocalFilesScan
 from gphotos_sync.Logging import setup_logging
@@ -49,7 +53,6 @@ class GooglePhotosSyncMain:
         self.google_photos_client: RestClient
         self.google_photos_idx: GooglePhotosIndex
         self.google_photos_down: GooglePhotosDownload
-        self.google_albums_sync: GoogleAlbumsSync
         self.local_files_scan: LocalFilesScan
         self._start_date: Optional[DateTime]
         self._end_date = Optional[DateTime]
@@ -214,6 +217,32 @@ class GooglePhotosSyncMain:
     )
     parser.add_argument("--new-token", action="store_true", help="Request new token")
     parser.add_argument(
+        "--picker-max-items",
+        help="maximum number of items that may be selected in each Google "
+        "Photos Picker session (Google's limit is 2000)",
+        type=int,
+        default=PickerSession.MAX_ITEMS,
+    )
+    parser.add_argument(
+        "--picker-timeout",
+        help="seconds to wait for media to be picked in the browser "
+        "(default: as recommended by Google, usually 30 minutes)",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="do not try to open the Picker URL in a local web browser, just "
+        "print it",
+    )
+    parser.add_argument(
+        "--picker-once",
+        action="store_true",
+        help="run a single Picker session and exit instead of offering to "
+        "pick another batch",
+    )
+    parser.add_argument(
         "--index-only",
         action="store_true",
         help="Only build the index of files in .gphotos.db - no downloads",
@@ -354,13 +383,11 @@ class GooglePhotosSyncMain:
         if args.new_token and credentials_file.exists():
             credentials_file.unlink()
 
-        scope = [
-            "https://www.googleapis.com/auth/photoslibrary.readonly",
-            "https://www.googleapis.com/auth/photoslibrary.sharing",
-        ]
-        photos_api_url = (
-            "https://photoslibrary.googleapis.com/$discovery" "/rest?version=v1"
-        )
+        # Google removed the photoslibrary.readonly and photoslibrary.sharing
+        # scopes on 31 March 2025, only the Picker API can read a user's
+        # library now. See https://developers.google.com/photos/support/updates
+        scope = [PICKER_SCOPE]
+        photos_api_url = PICKER_API_URL
 
         self.auth = Authorize(
             scope,
@@ -408,17 +435,10 @@ class GooglePhotosSyncMain:
             self.auth.session,  # type: ignore
         )
         self.google_photos_idx = GooglePhotosIndex(
-            self.google_photos_client, root_folder, self.data_store, settings
+            root_folder, self.data_store, settings
         )
         self.google_photos_down = GooglePhotosDownload(
-            self.google_photos_client, root_folder, self.data_store, settings
-        )
-        self.google_albums_sync = GoogleAlbumsSync(
-            self.google_photos_client,
-            root_folder,
-            self.data_store,
-            args.flush_index or args.retry_download or args.rescan,
-            settings,
+            self.auth.access_token, root_folder, self.data_store, settings
         )
         if args.compare_folder:
             self.local_files_scan = LocalFilesScan(
@@ -427,39 +447,42 @@ class GooglePhotosSyncMain:
                 self.data_store,  # type: ignore
             )
 
+    def new_picker(self, args: Namespace) -> PickerSession:
+        return PickerSession(
+            self.google_photos_client,
+            max_items=args.picker_max_items,
+            timeout=args.picker_timeout,
+            open_browser=not args.no_browser,
+        )
+
+    @staticmethod
+    def pick_again() -> bool:
+        if not sys.stdin.isatty():
+            return False
+        try:
+            answer = input("\nPick another batch of media to back up? [y/N] ")
+        except EOFError:
+            return False
+        return answer.strip().lower() in ("y", "yes")
+
     def do_sync(self, args: Namespace):
-        files_downloaded = 0
         with self.data_store:
-            if not args.skip_index:
-                if not args.skip_files and not args.album and not args.album_regex:
-                    self.google_photos_idx.index_photos_media()
-
-            if not args.index_only:
-                if not args.skip_files:
-                    files_downloaded = self.google_photos_down.download_photo_media()
-
-            if (
-                not args.skip_albums
-                and not args.skip_index
-                and (files_downloaded > 0 or args.skip_files or args.rescan)
-            ) or (args.album is not None or args.album_regex is not None):
-                self.google_albums_sync.index_album_media()
-                # run download again to pick up files indexed in albums only
-                if not args.index_only:
-                    if not args.skip_files:
-                        files_downloaded = (
-                            self.google_photos_down.download_photo_media()
-                        )
-
-            if not args.index_only:
-                if (
-                    not args.skip_albums
-                    and (files_downloaded > 0 or args.skip_files or args.rescan)
-                    or (args.album is not None or args.album_regex is not None)
-                ):
-                    self.google_albums_sync.create_album_content_links()
-                if args.do_delete:
-                    self.google_photos_idx.check_for_removed()
+            if not args.skip_index and not args.skip_files:
+                while True:
+                    picker = self.new_picker(args)
+                    try:
+                        picker.create()
+                        picker.prompt_user()
+                        picker.wait_for_selection()
+                        items = picker.list_items()
+                        self.google_photos_idx.index_picked_media(items)
+                        if not args.index_only:
+                            self.google_photos_down.download_photo_media(picker)
+                    finally:
+                        picker.delete()
+                    self.data_store.store()
+                    if args.picker_once or not self.pick_again():
+                        break
 
             if args.compare_folder:
                 if not args.skip_index:
@@ -469,6 +492,43 @@ class GooglePhotosSyncMain:
 
     def start(self, args: Namespace):
         self.do_sync(args)
+
+    @staticmethod
+    def unsupported_options(args: Namespace) -> Namespace:
+        """Options that relied on the Google Photos Library API scopes that
+        Google removed on 31 March 2025. The Picker API returns no album,
+        sharing, favourite or archive information and cannot see the whole
+        library."""
+        if args.album or args.album_regex:
+            log.error(
+                "--album and --album-regex are no longer supported: Google "
+                "removed album access for third party apps. Open the album in "
+                "the Picker and select its contents instead."
+            )
+            exit(1)
+        if args.do_delete:
+            log.error(
+                "--do-delete is no longer supported: the Picker API cannot see "
+                "the whole library so deleted media cannot be detected."
+            )
+            exit(1)
+        if args.skip_index:
+            log.warning(
+                "--skip-index: download URLs are only available for media "
+                "picked in a live Picker session, nothing will be downloaded."
+            )
+        ignored = [
+            ("favourites_only", "--favourites-only"),
+            ("archived", "--archived"),
+            ("rescan", "--rescan"),
+        ]
+        for attr, flag in ignored:
+            if getattr(args, attr):
+                log.warning("%s is ignored with the Google Photos Picker API", flag)
+        if not args.skip_albums:
+            log.info("album and shared album sync is not possible with the Picker API")
+        args.skip_albums = True
+        return args
 
     @staticmethod
     def fs_checks(root_folder: Path, args):
@@ -533,6 +593,7 @@ class GooglePhotosSyncMain:
         log.warning(f"gphotos-sync {__version__} {start_time}")
 
         args = self.fs_checks(root_folder, args)
+        args = self.unsupported_options(args)
 
         lock_file = db_path / "gphotos.lock"
         fp = lock_file.open("w")

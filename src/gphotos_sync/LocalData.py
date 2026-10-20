@@ -290,6 +290,36 @@ class LocalData:
             # the file is new and has no duplicates
             return 0, None
 
+    def find_same_file(
+        self, orig_name: str, path: str, create_date: datetime
+    ) -> Optional[DatabaseMedia]:
+        """find an existing entry with the same original name, folder and
+        creation date. Used to recognise media that was indexed before under
+        a different remote id (e.g. from the Library API or from an earlier
+        Picker session) so that it is not downloaded a second time.
+        """
+        if self.case_insensitive:
+            clause = "lower(OrigFileName) = ?"
+            name = orig_name.lower()
+        else:
+            clause = "OrigFileName = ?"
+            name = orig_name
+        query = (
+            "SELECT {0} FROM SyncFiles WHERE Path = ? AND {1} "
+            "AND CreateDate = ?;".format(GooglePhotosRow.columns, clause)
+        )
+        self.cur.execute(query, (path, name, create_date))
+        result = self.cur.fetchone()
+        if result:
+            return GooglePhotosRow(result).to_media()
+        return None
+
+    def put_remote_id(self, old_remote_id: str, new_remote_id: str):
+        self.cur.execute(
+            "UPDATE SyncFiles SET RemoteId=? WHERE RemoteId IS ?;",
+            (new_remote_id, old_remote_id),
+        )
+
     def put_location(self, sync_file_id: str, location: str):
         self.cur.execute(
             "UPDATE SyncFiles SET Location=? " "WHERE RemoteId IS ?;",

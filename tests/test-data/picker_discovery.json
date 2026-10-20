@@ -1,0 +1,107 @@
+{
+ "baseUrl": "https://photospicker.googleapis.com/",
+ "resources": {
+  "mediaItems": {
+   "methods": {
+    "list": {
+     "id": "photospicker.mediaItems.list",
+     "response": {
+      "$ref": "ListMediaItemsResponse"
+     },
+     "description": "Returns a list of media items picked by the user during the specified session. A `FAILED_PRECONDITION` error is returned if the user has not yet finished picking media items for the specified session. In this scenario, your application should poll `sessions.get` until the session is ready before retrying this method.",
+     "parameters": {
+      "sessionId": {
+       "description": "Required. The Google-generated identifier for this session.",
+       "location": "query",
+       "type": "string"
+      },
+      "pageSize": {
+       "type": "integer",
+       "location": "query",
+       "format": "int32",
+       "description": "Optional. The maximum number of media items to return. The service may return fewer than this value (including zero results). If unspecified or set to 0, at most 50 media items is returned. The maximum value is 100; values above 100 will be coerced to 100. Negative values will result in an `INVALID_ARGUMENT` error."
+      },
+      "pageToken": {
+       "description": "Optional. A page token, received from a previous `mediaItems.list` call. Provide this to retrieve the subsequent page.",
+       "location": "query",
+       "type": "string"
+      }
+     },
+     "path": "v1/mediaItems",
+     "parameterOrder": [],
+     "flatPath": "v1/mediaItems",
+     "httpMethod": "GET"
+    }
+   }
+  },
+  "sessions": {
+   "methods": {
+    "create": {
+     "httpMethod": "POST",
+     "parameters": {
+      "requestId": {
+       "description": "Optional. A client-provided unique identifier for this request. This ID is used to enable the streamlined picking experience for applications using the OAuth 2.0 flow for limited-input devices. This ID must have the format of a UUID (version 4) string and follow these requirements: - Must not contain any sensitive identifying information about the user. - Must contain 32 hexadecimal characters divided into five groups separated by hyphens, in the format \"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\" (or 8-4-4-4-12).",
+       "location": "query",
+       "type": "string"
+      }
+     },
+     "response": {
+      "$ref": "PickingSession"
+     },
+     "path": "v1/sessions",
+     "flatPath": "v1/sessions",
+     "id": "photospicker.sessions.create",
+     "request": {
+      "$ref": "PickingSession"
+     },
+     "description": "Generates a new session during which the user can pick photos and videos for third-party access. If the user doesn't have an active Google Photos account, a `FAILED_PRECONDITION` error is returned. If the client application creates too many sessions per user, a `RESOURCE_EXHAUSTED` error is returned. Clients are unlikely to reach these limits under normal circumstances. However, clients are still recommended to call `sessions.delete` after each session, to proactively stay within resource limits. Once [a user taps the **Done**](https://developers.google.com/photos/picker/guides/picking-experience#done_screen) button to complete a picking session, the `pickerUri` will no longer work. Create a new session to allow the user to pick more photos.",
+     "parameterOrder": []
+    },
+    "delete": {
+     "parameters": {
+      "sessionId": {
+       "location": "path",
+       "pattern": "^[^/]+$",
+       "required": true,
+       "type": "string",
+       "description": "Required. The Google-generated identifier for the session to delete."
+      }
+     },
+     "parameterOrder": [
+      "sessionId"
+     ],
+     "response": {
+      "$ref": "Empty"
+     },
+     "httpMethod": "DELETE",
+     "id": "photospicker.sessions.delete",
+     "path": "v1/sessions/{+sessionId}",
+     "description": "Deletes the specified session. A `NOT_FOUND` error is returned if the session does not exist or is not owned by the user. An empty response indicates successful deletion.",
+     "flatPath": "v1/sessions/{sessionsId}"
+    },
+    "get": {
+     "flatPath": "v1/sessions/{sessionsId}",
+     "id": "photospicker.sessions.get",
+     "parameterOrder": [
+      "sessionId"
+     ],
+     "description": "Retrieves information about the specified session. If the specified session does not exist or is not owned by the user, a `NOT_FOUND` error is returned. If the session exists but access to the session has expired, a `PERMISSION_DENIED` error is returned.",
+     "response": {
+      "$ref": "PickingSession"
+     },
+     "path": "v1/sessions/{+sessionId}",
+     "httpMethod": "GET",
+     "parameters": {
+      "sessionId": {
+       "type": "string",
+       "pattern": "^[^/]+$",
+       "description": "Required. The Google-generated identifier for this session.",
+       "location": "path",
+       "required": true
+      }
+     }
+    }
+   }
+  }
+ }
+}

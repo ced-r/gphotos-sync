@@ -1,3 +1,53 @@
+Fork: Google Photos Picker API support
+======================================
+
+Upstream was archived in October 2024. On 31 March 2025 Google removed the
+``photoslibrary.readonly`` and ``photoslibrary.sharing`` scopes, so upstream
+fails with ``403 Request had insufficient authentication scopes``. See
+https://developers.google.com/photos/support/updates
+
+This fork uses the `Google Photos Picker API
+<https://developers.google.com/photos/picker>`_ (scope
+``photospicker.mediaitems.readonly``) instead.
+
+How it works now
+----------------
+
+1. gphotos-sync prints (and opens) a Google Photos Picker URL.
+2. Select the photos/videos to back up in your browser (max 2000 per
+   session; select by date or open an album and select all), then click Done.
+3. The selected items are indexed and downloaded into ``photos/YYYY/MM``.
+   Items already backed up are skipped, so re-picking overlapping ranges is
+   safe.
+4. You are offered another batch (use ``--picker-once`` to stop after one).
+
+Setup changes
+-------------
+
+- In Google Cloud Console enable the **Google Photos Picker API** for the
+  project that owns your ``client_secret.json`` and add the scope
+  ``.../auth/photospicker.mediaitems.readonly`` to the OAuth consent screen.
+- Existing tokens with the old scopes are detected and replaced
+  automatically (or use ``--new-token``).
+
+Limitations imposed by Google
+-----------------------------
+
+- Someone has to pick the media in a browser, so unattended (cron) full
+  library sync is no longer possible.
+- No album or shared album information: ``--album`` / ``--album-regex`` and
+  album folders are gone. ``--do-delete`` is disabled because the deletion of
+  media can no longer be detected. ``--favourites-only``, ``--archived`` and
+  ``--rescan`` are ignored.
+- ``--start-date``, ``--end-date`` and ``--skip-video`` are applied locally
+  to the picked items.
+- Download URLs only last 60 minutes and only exist during a Picker session.
+  The tool refreshes them as needed. Items that could not be downloaded
+  (e.g. videos still processing) must be picked again in a later run.
+
+New options: ``--picker-max-items``, ``--picker-timeout``, ``--no-browser``,
+``--picker-once``.
+
 So long and thanks for all the contributions!
 =============================================
 

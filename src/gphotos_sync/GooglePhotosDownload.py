@@ -11,19 +11,19 @@ from asyncio import Future
 from datetime import datetime
 from itertools import zip_longest
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Union
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Union
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException, Timeout
+from requests.exceptions import HTTPError, RequestException, Timeout
 from urllib3.util.retry import Retry
 
 from gphotos_sync import Utils
 from gphotos_sync.BadIds import BadIds
 from gphotos_sync.DatabaseMedia import DatabaseMedia
+from gphotos_sync.GooglePhotosPicker import PickerSession
 from gphotos_sync.GooglePhotosRow import GooglePhotosRow
 from gphotos_sync.LocalData import LocalData
-from gphotos_sync.restclient import RestClient
 
 from .Settings import Settings
 
@@ -46,18 +46,25 @@ class GooglePhotosDownload(object):
     BATCH_SIZE: int = 40
 
     def __init__(
-        self, api: RestClient, root_folder: Path, db: LocalData, settings: Settings
+        self,
+        access_token: Callable[[], str],
+        root_folder: Path,
+        db: LocalData,
+        settings: Settings,
     ):
         """
         Parameters:
-            api: object representing the Google REST API
+            access_token: returns a valid OAuth bearer token, Picker API
+              base URLs require an Authorization header
             root_folder: path to the root of local file synchronization
             db: local database for indexing
             settings: further arguments
         """
         self._db: LocalData = db
         self._root_folder: Path = root_folder
-        self._api: RestClient = api
+        self._access_token = access_token
+        self._picker: Optional[PickerSession] = None
+        self.files_not_ready: int = 0
 
         self.files_downloaded: int = 0
         self.files_download_started: int = 0
@@ -100,12 +107,16 @@ class GooglePhotosDownload(object):
     def close(self):
         self._session.close()
 
-    def download_photo_media(self):
+    def download_photo_media(self, picker: PickerSession):
         """
-        here we batch up our requests to get base url for downloading media.
-        This avoids the overhead of one REST call per file. A REST call
-        takes longer than downloading an image
+        Download all indexed media that was picked in the given Picker
+        session and has not yet been downloaded.
+
+        Base URLs are only available for items picked in a live Picker
+        session so items indexed in earlier runs but not downloaded must be
+        picked again.
         """
+        self._picker = picker
 
         def grouper(
             iterable: Iterable[DatabaseMedia],
@@ -130,6 +141,9 @@ class GooglePhotosDownload(object):
 
                 items = (mi for mi in media_items_block if mi)
                 for media_item in items:
+                    if media_item.id not in picker:
+                        # no base URL available - not picked this session
+                        continue
                     if self.case_insensitive_fs:
                         relative_folder = str(media_item.relative_folder).lower()
                         filename = str(media_item.filename).lower()
@@ -148,6 +162,14 @@ class GooglePhotosDownload(object):
                                 media_item.relative_path,
                             )
                             self._db.put_downloaded(media_item.id)
+
+                        elif not picker.is_ready(media_item.id):
+                            self.files_not_ready += 1
+                            log.warning(
+                                "SKIPPED %s - video is still being processed by "
+                                "Google, pick it again later",
+                                media_item.relative_path,
+                            )
 
                         elif self.bad_ids.check_id_ok(media_item.id):
                             batch[media_item.id] = media_item
@@ -177,10 +199,12 @@ class GooglePhotosDownload(object):
             futures_left = list(self.pool_future_to_media.keys())
             self.do_download_complete(futures_left)
             log.warning(
-                "Downloaded %d Items, Failed %d, Already Downloaded %d",
+                "Downloaded %d Items, Failed %d, Already Downloaded %d, "
+                "Not Ready %d",
                 self.files_downloaded,
                 self.files_download_failed,
                 self.files_download_skipped,
+                self.files_not_ready,
             )
             self.bad_ids.store_ids()
             self.bad_ids.report()
@@ -189,32 +213,16 @@ class GooglePhotosDownload(object):
     def download_batch(self, batch: Mapping[str, DatabaseMedia]):
         """Downloads a batch of media items collected in download_photo_media.
 
-        A fresh 'base_url' is required since they have limited lifespan and
-        these are obtained by a single call to the service function
-        mediaItems.batchGet.
+        A fresh 'base_url' is required since they have a limited lifespan.
+        The picker session re-lists its items to refresh them when needed.
         """
         try:
-            response = self._api.mediaItems.batchGet.execute(mediaItemIds=batch.keys())
-            r_json = response.json()
-            if r_json.get("pageToken"):
-                log.error("Ops - Batch size too big, some items dropped!")
-
-            for i, result in enumerate(r_json["mediaItemResults"]):
-                media_item_json = result.get("mediaItem")
-                if not media_item_json:
-                    log.warning("Null response in mediaItems.batchGet %s", batch.keys())
-                    log.debug(
-                        "Null response in mediaItems.batchGet"
-                        "for item %d in\n\n %s \n\n which is \n%s",
-                        i,
-                        str(r_json),
-                        str(result),
-                    )
-                else:
-                    media_item = batch.get(media_item_json["id"])
-                    self.download_file(media_item, media_item_json)
-        except RequestException:
-            self.find_bad_items(batch)
+            for media_id, media_item in batch.items():
+                base_url = self._picker.base_url(media_id)
+                if not base_url:
+                    log.warning("No base URL for %s", media_item.relative_path)
+                    continue
+                self.download_file(media_item, base_url)
 
         except KeyboardInterrupt:
             log.warning("Cancelling download threads ...")
@@ -224,7 +232,7 @@ class GooglePhotosDownload(object):
             log.warning("Cancelled download threads")
             raise
 
-    def download_file(self, media_item: DatabaseMedia, media_json: dict):
+    def download_file(self, media_item: DatabaseMedia, base_url: str):
         """farms a single media download off to the thread pool.
 
         Uses a dictionary of Futures -> mediaItem to track downloads that are
@@ -232,8 +240,6 @@ class GooglePhotosDownload(object):
         do_download_complete to remove the Future from the dictionary and
         complete processing of the media item.
         """
-        base_url = media_json["baseUrl"]
-
         # we dont want a massive queue so wait until at least one thread is free
         while len(self.pool_future_to_media) >= self.max_threads:
             # check which futures are done, complete the main thread work
@@ -243,17 +249,31 @@ class GooglePhotosDownload(object):
                 if future.done():
                     done_list.append(future)
 
-            self.do_download_complete(done_list)
+            if done_list:
+                self.do_download_complete(done_list)
+            else:
+                futures.wait(
+                    list(self.pool_future_to_media.keys()),
+                    return_when=futures.FIRST_COMPLETED,
+                )
+
+        # fetch the token in the main thread so that any refresh is not
+        # performed concurrently by worker threads
+        headers = {"Authorization": "Bearer {}".format(self._access_token())}
 
         # start a new background download
         self.files_download_started += 1
         log.info(
             "downloading %d %s", self.files_download_started, media_item.relative_path
         )
-        future = self.download_pool.submit(self.do_download_file, base_url, media_item)
+        future = self.download_pool.submit(
+            self.do_download_file, base_url, media_item, headers
+        )
         self.pool_future_to_media[future] = media_item
 
-    def do_download_file(self, base_url: str, media_item: DatabaseMedia):
+    def do_download_file(
+        self, base_url: str, media_item: DatabaseMedia, headers: Dict[str, str]
+    ):
         """Runs in a process pool and does a download of a single media item."""
         if self.case_insensitive_fs:
             relative_folder = str(media_item.relative_folder).lower()
@@ -274,7 +294,9 @@ class GooglePhotosDownload(object):
         t_path = Path(temp_file.name)
 
         try:
-            response = self._session.get(download_url, stream=True, timeout=timeout)
+            response = self._session.get(
+                download_url, stream=True, timeout=timeout, headers=headers
+            )
             response.raise_for_status()
             shutil.copyfileobj(response.raw, temp_file)
             temp_file.close()
@@ -347,7 +369,16 @@ class GooglePhotosDownload(object):
                 # be deleted to retry these items. Also do this for timeouts
                 # which have been reported as happening on files missing on
                 # the server. See #480 and #488
-                if isinstance(e, RequestException) or isinstance(e, Timeout):
+                if isinstance(e, HTTPError) and getattr(
+                    e.response, "status_code", None
+                ) in (401, 403):
+                    # the base URL expired or access was revoked, this is
+                    # not a problem with the media item so allow a retry
+                    log.warning(
+                        "access denied for %s, pick it again to retry",
+                        media_item.relative_path,
+                    )
+                elif isinstance(e, RequestException) or isinstance(e, Timeout):
                     self.bad_ids.add_id(
                         media_item.relative_path, media_item.id, media_item.url, e
                     )
@@ -366,25 +397,3 @@ class GooglePhotosDownload(object):
                 if self.settings.progress and self.files_downloaded % 10 == 0:
                     log.warning(f"Downloaded {self.files_downloaded} items ...\033[F")
             del self.pool_future_to_media[future]
-
-    def find_bad_items(self, batch: Mapping[str, DatabaseMedia]):
-        """
-        a batch get failed. Now do all of its contents as individual
-        gets so we can work out which ID(s) cause the failure
-        """
-        for item_id, media_item in batch.items():
-            try:
-                log.debug("BAD ID Retry on %s (%s)", item_id, media_item.relative_path)
-                response = self._api.mediaItems.get.execute(mediaItemId=item_id)
-                media_item_json = response.json()
-                self.download_file(media_item, media_item_json)
-            except RequestException as e:
-                self.bad_ids.add_id(
-                    str(media_item.relative_path), media_item.id, media_item.url, e
-                )
-                self.files_download_failed += 1
-                log.error(
-                    "FAILURE %d in get of %s BAD ID",
-                    self.files_download_failed,
-                    media_item.relative_path,
-                )

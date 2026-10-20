@@ -85,8 +85,10 @@ class Method:
             k: k_args[k] for k in self.query_args if k in k_args
         }
         path: str = self.service.base_url + self.make_path(path_args)
+        headers = {}
         if body:
             body = dumps(body)
+            headers["Content-Type"] = "application/json"
 
         log.trace(  # type: ignore
             "\nREQUEST: %s to %s params=%s\n%s",
@@ -96,7 +98,12 @@ class Method:
             body,
         )
         result = self.service.auth_session.request(
-            self.httpMethod, data=body, url=path, timeout=10, params=query_args
+            self.httpMethod,
+            data=body,
+            url=path,
+            timeout=10,
+            params=query_args,
+            headers=headers,
         )
         log.trace(  # type: ignore
             "\nRESPONSE: %s\n%s", result.status_code, str(result.content)
